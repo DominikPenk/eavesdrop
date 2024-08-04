@@ -5,7 +5,7 @@ setup(
     name="eavesdrop",
     version="0.9.0",
     author="Dominik Penk",
-    description="Single-file, dependency-free publisher-subscriber implementation.",
+    description="A single-file, dependency-free Python event system.",
     py_modules=["eavesdrop"],
     url="https://github.com/DominikPenk/eavesdrop",
     install_requires=[],
