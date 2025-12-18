@@ -1,6 +1,9 @@
 # Eavesdrop
 
-Eavesdrop is a single-file, dependency-free library implementing a classic publisher-subscriber pattern. 
+Eavesdrop is a single-file, dependency-free library implementing a small
+publisher–subscriber pattern for Python. It provides a tiny API to define
+typed events, publish them globally or from a specific publisher, and
+register listeners or eavesdroppers.
 
 ## Installation
 
@@ -16,124 +19,101 @@ pip install git+https://github.com/DominikPenk/eavesdrop.git
 
 The code is documented and (hopefully) easy to understand, so feel free to explore the [source file](eavesdrop.py) for more details.
 
-The key part of Eavesdrop is publishing and describing events. 
-Eavesdrop supports three methods for defining events and their payloads:
+The key part of Eavesdrop is publishing and describing events. Events are
+defined by subclassing the provided `Event` base class; instances of those
+subclasses are passed to `publish`.
 
-### 1.Using a Dataclass Decorated with @event
-This method is recommended for ensuring consistent data and structure for the events being raised. 
-The event class is decorated with the @event decorator and can be published by passing an instance of the event class.
-The `@event` decorator internally converts the decorated class to a dataclass and adds the `evt_type` attribute to the class (which is a unique identifier for this event).
+### Events
+
+Eavesdrop defines events by subclassing the provided `Event` base class.
+When you subclass `Event` the library will convert your subclass into a
+dataclass and attach a unique `evt_type` identifier to the class.
+
+Example:
 
 ```python
-from eavesdrop import *
+from eavesdrop import Event, listen, publish
 
-@event
-class MyEvent:
+class MyEvent(Event):
     msg: str
 
 listen(MyEvent, lambda evt: print("🎧", evt.msg))
 
-# Publishing the event
+# Publish a typed event instance
 publish(MyEvent(msg="Hello, World!"))
 ```
 
-Expected output:
-```bash
+Output:
+
+```
 🎧 Hello, World!
 ```
 
-### 2. Using an Event Name and Keyword Arguments
-You can publish an event by specifying an event name as a string and passing keyword arguments. 
-The keyword arguments will be bundled into a dictionary and passed to the listeners.
-A small gotcha here is that the dictionary will be updated with the `event` key before being passed to the listeners.
+Notes on event forms
+
+This implementation focuses on typed events via `Event` subclasses. The
+primary, recommended approach is to define events as subclasses of
+`Event` and pass instances of those classes to `publish`.
+
+### Event scope
+
+You can publish events globally (via the module-level `publish`) or from a
+specific `Publisher` instance. Use `publish`/`listen` on a `Publisher` to
+scope events to that provider:
 
 ```python
-from eavesdrop import *
+from eavesdrop import Event, Publisher
 
-listen("my_event", lambda evt: print("🎧", evt))
-
-# Publishing the event
-publish(MyEvent("my_event", msg="Hello, World!"))
-```
-
-Expected output:
-```bash
-🎧 {"event": "my_event", "msg": "Hello, World!"}
-```
-
-### 3.  Using a Dictionary
-Create an event by passing dictionary to the `publish` method. 
-This dictionary must contain a `event` key with the name of the event.
-We do not recommend to use this method since it is the most error-prone one. 
-
-```python
-from eavesdrop import *
-
-listen("my_event", lambda evt: print("🎧", evt))
-
-# Publishing the event
-publish({"event:": "my_event", "msg": "Hello, World!"})
-```
-
-Expected output:
-```bash
-🎧 {"event": "my_event", "msg": "Hello, World!"}
-```
-
-### Event Scope
-
-In the above example, we published events to the global scope.
-Eavesdrop supports publishing events locally from a specific `Publisher`.
-To do you just need to inherit from the `eavesdrop.Publisher` class and use the `publish` and `listen` methods:
-
-```python
-from eavesdrop import event, Publisher
-
-@event
-class MyEvent:
+class MyEvent(Event):
     msg: str
 
 class MyPublisher(Publisher):
-    ...
+    pass
 
-my_publisher = MyPublisher()
+pub = MyPublisher()
 
-my_publisher.listen(MyEvent, lambda evt: print("🎧", evt.msg))
-
-my_publisher.publish(MyEvent(msg="Hello, World!"))
+pub.listen(MyEvent, lambda evt: print("🎧", evt.msg))
+pub.publish(MyEvent(msg="Hello, World!"))
 ```
 
-The publisher class supports the same three event types as global event publishing.
+Listeners registered on a `Publisher` only receive events published by that
+publisher. The global `listen` and `publish` functions operate on a global
+registry.
 
 ### Eavesdropping
 
-If you are interested in reacting to all published events of a certain type you can use `eavesdrop.eavesdrop`:
+If you want to observe every publication of a given event type regardless
+of provider, register an eavesdropper with `eavesdrop` or
+`eavesdrop_once` (the latter removes itself after the first call):
 
 ```python
-from eavesdrop import *
+from eavesdrop import Event, Publisher, eavesdrop, publish
 
-@event
-class MyEvent:
+class MyEvent(Event):
     msg: str
 
-class MyPublisher(Publisher):
-    ...
+def all_events(evt, provider):
+    print("🔍", evt.msg, "by", provider)
 
-my_publisher = MyPublisher()
+eavesdrop(MyEvent, all_events)
 
-eavesdrop(MyEvent, lambda evt: print("", evt.msg))
-
-my_publisher.publish(MyEvent(msg="Local: Hello, World!"))
-publish(MyEvent(msg="Global: Hello, World!"))
+publish(MyEvent(msg="Global hello"))
 ```
 
-Expected output:
-```bash
-🔍 Local: Hello, World!
-🔍 Global: Hello, World!
+Eavesdroppers receive two arguments: the event instance and the publishing
+provider (or `None` for global publishes).
+
+### Stop listening
+
+All `listen` and `eavesdrop` functions return a `ListenerHandle` with the
+method `stop_listening()` to unregister the listener. If you only need a
+single invocation, use `listen_once` or `eavesdrop_once` which remove the
+listener automatically after the first call.
+
+## Try the bundled example
+
+There is an example runner in `example.py`. To try it locally:
+
+```powershell
+python example.py
 ```
-
-### Stop Listening
-
-All `listen` methods return a handle with the method `stop_listening()` that can be used to stop the listener.
-If you want a listener that only reacts to the next instance of the event you can create a self-deleting one with the `listen_once` and `eavesdrop_once` functions.

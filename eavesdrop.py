@@ -4,12 +4,21 @@ import tkinter as tk
 import warnings
 import weakref
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, Type
+from dataclasses import dataclass, is_dataclass
+from typing import (
+    Callable,
+    ClassVar,
+    Optional,
+    Protocol,
+    TypeAlias,
+    TypeVar,
+    cast,
+    dataclass_transform,
+)
 from uuid import UUID, uuid4
 
 __all__ = [
-    "event",
+    "Event",
     "Publisher",
     "ListenerHandle",
     "publish",
@@ -21,61 +30,39 @@ __all__ = [
 ]
 
 
-def event(
-    cls=None,
-    /,
-    **kwargs,
-):
-    """
-    A decorator for turning a class into a dataclass usable as an event.
-
-    Usage:
-        @event
-        class MyEvent:
-            msg: str
-
-        raise_event(MyEvent(msg="Hello, World!"))
-
-    Parameters:
-        cls (type, optional): The class to be decorated. If not provided, the decorator returns a wrapper function.
-        **kwargs: Additional keyword arguments to be passed to the `dataclass` decorator.
-
-    Returns:
-        type or Callable: If `cls` is provided, the decorated class is returned. If `cls` is not provided, a wrapper function is returned.
-
-    """
-
-    def wrap(cls):
-        cls.evt_type = uuid4()
-        return dataclass(
-            cls,
-            **kwargs,
-        )
-
-    if cls is None:
-        return wrap
-
-    return wrap(cls)
+@dataclass_transform()
+class Event:
+    def __init_subclass__(cls) -> None:
+        if not is_dataclass(cls):
+            cls = dataclass(cls)
 
 
-ListenerDict = dict[UUID, Callable]
+GE = TypeVar("GE", bound="Event", contravariant=True)
+E = TypeVar("E", bound="Event")
+
+ProviderID: TypeAlias = UUID
+ListenerID: TypeAlias = UUID
+EventType: TypeAlias = type[E]
 
 
-class ListenerCallback(Protocol):
-    def __call__(self, evt: Any) -> None: ...
+class ListenerCallback(Protocol[GE]):
+    def __call__(self, evt: GE) -> None: ...
 
     def stop_listening(self) -> None: ...
 
 
-class EavesdropperCallback(Protocol):
-    def __call__(self, evt: Any, provider: Publisher | None) -> None: ...
+class EavesdropperCallback(Protocol[GE]):
+    def __call__(self, evt: GE, provider: Optional[Publisher]) -> None: ...
 
     def stop_listening(self) -> None: ...
 
 
 class ListenerHandle(object):
     def __init__(
-        self, provider: Publisher | EventRegistry | None, idx: UUID, evt_type: UUID
+        self,
+        provider: Optional[Publisher | EventRegistry],
+        idx: ListenerID,
+        evt_type: EventType,
     ):
         # Store the provider as a weak reference
         self._provider = weakref.ref(provider) if provider is not None else None
@@ -83,16 +70,10 @@ class ListenerHandle(object):
         self._evt_type = evt_type
 
     def stop_listening(self):
-        """
-        Stop listening to events.
+        """Stop listening for the event tied to this handle.
 
-        This method stops the listener from receiving events.
-
-        Parameters:
-            None
-
-        Returns:
-            None
+        Calling this will unregister the underlying listener or eavesdropper
+        so the callable will no longer be invoked for future events.
         """
         if self._provider is None:
             EventRegistry.get_instance().stop_eavsdropping(self)
@@ -101,7 +82,7 @@ class ListenerHandle(object):
 
 
 class EventRegistry:
-    _instance: EventRegistry | None = None
+    _instance: ClassVar[Optional[EventRegistry]] = None
 
     def __init__(self):
         if EventRegistry._instance is not None:
@@ -111,35 +92,13 @@ class EventRegistry:
 
         self._evt_provider_id = uuid4()
 
-        self.events_types: dict[str, UUID] = defaultdict(uuid4)
-        self.listeners: dict[UUID, dict[UUID, ListenerDict]] = defaultdict(
-            lambda: defaultdict(dict)
-        )
-        self.eavesdropper: dict[UUID, ListenerDict] = defaultdict(dict)
-
-    def _get_event_id(self, evt: Any) -> UUID:
-        if isinstance(evt, dict):
-            if "event" not in evt:
-                raise RuntimeError("Missing 'event' field in event")
-            return self._get_event_id(evt["event"])
-        elif isinstance(evt, str):
-            return self.get_instance().events[evt]
-        elif isinstance(evt, UUID):
-            return evt
-        try:
-            return evt.evt_type
-        except AttributeError:
-            raise ValueError("'evt' is not a valid event type")
-
-    def _get_publisher_id(self, provider: Publisher | None) -> UUID:
-        if provider is None:
-            return self._evt_provider_id
-        elif not isinstance(provider, Publisher):
-            raise ValueError("'provider' must be an EventProvider")
-        else:
-            if not hasattr(provider, "_evt_provider_id"):
-                setattr(provider, "_evt_provider_id", uuid4())
-            return provider._evt_provider_id
+        self.listeners: dict[
+            ProviderID,
+            dict[EventType, dict[ListenerID, Callable[[Event], None]]],
+        ] = defaultdict(lambda: defaultdict(dict))
+        self.eavesdropper: dict[
+            EventType, dict[ListenerID, Callable[[Event, Optional[Publisher]], None]]
+        ] = defaultdict(dict)
 
     @classmethod
     def get_instance(cls) -> EventRegistry:
@@ -147,55 +106,55 @@ class EventRegistry:
             cls._instance = cls()
         return cls._instance
 
-    def publish(self, evt: Any, provider: Optional[Publisher] = None, **kwargs) -> None:
-        if kwargs and not isinstance(evt, str):
-            raise RuntimeError("Cannot pass kwargs if 'evt' is not a string")
-        elif kwargs:
-            evt = {
-                "event": evt,
-                **kwargs,
-            }
+    def publish(
+        self,
+        evt: Event,
+        provider: Optional[Publisher] = None,
+    ) -> None:
+        publisher_id = (
+            provider._evt_provider_id if provider is not None else self._evt_provider_id
+        )
+        event_type = type(evt)
 
-        eid = self._get_event_id(evt)
-        pid = self._get_publisher_id(provider)
-
-        listeners = list(self.listeners[pid][eid].values())
+        listeners = list(self.listeners[publisher_id][event_type].values())
         for listener in listeners:
             listener(evt)
 
-        eavesdroppers = list(self.eavesdropper[eid].values())
+        eavesdroppers = list(self.eavesdropper[event_type].values())
         for eavesdropper in eavesdroppers:
             eavesdropper(evt, provider)
 
     def add_listener(
         self,
-        evt: Any,
-        callback: Callable,
+        evt: type[E],
+        callback: Callable[[E], None],
         provider: Optional[Publisher] = None,
         onetime: bool = False,
     ) -> ListenerHandle:
-        eid = self._get_event_id(evt)
+        eid = evt
         lid = uuid4()
-        pid = self._get_publisher_id(provider)
 
-        provider = provider or self
+        actual_provider = provider or self
+        pid = actual_provider._evt_provider_id
 
-        handle = ListenerHandle(provider, lid, eid)
+        handle = ListenerHandle(actual_provider, lid, eid)
 
         if onetime:
 
-            def closure(evt):
+            def closure(evt) -> None:
                 callback(evt)
                 handle.stop_listening()
 
-            self.listeners[pid][eid][lid] = closure
+            # Note: we ignore type, so the type checker is happy
+            self.listeners[pid][eid][lid] = closure  # type: ignore
         else:
-            self.listeners[pid][eid][lid] = callback
+            # Note: we ignore type, so the type checker is happy
+            self.listeners[pid][eid][lid] = callback  # type: ignore
 
-        return ListenerHandle(provider, lid, eid)
+        return ListenerHandle(actual_provider, lid, eid)
 
     def stop_listening(self, handle: ListenerHandle) -> None:
-        provider: Publisher | EventRegistry | None = handle._provider()
+        provider = handle._provider() if handle._provider is not None else None
         if provider:
             pid = provider._evt_provider_id
             try:
@@ -206,9 +165,12 @@ class EventRegistry:
             warnings.warn("Provider out of scope")
 
     def add_eavesdropper(
-        self, evt: Any, callback: Callable, onetime: bool = False
+        self,
+        evt: type[E],
+        callback: Callable[[E, Optional[Publisher]], None],
+        onetime: bool = False,
     ) -> ListenerHandle:
-        eid = self._get_event_id(evt)
+        eid = evt
         lid = uuid4()
 
         h = ListenerHandle(None, lid, eid)
@@ -219,9 +181,9 @@ class EventRegistry:
                 callback(evt, provider)
                 h.stop_listening()
 
-            self.eavesdropper[eid][lid] = closure
+            self.eavesdropper[eid][lid] = closure  # type: ignore[assignment]
         else:
-            self.eavesdropper[eid][lid] = callback
+            self.eavesdropper[eid][lid] = callback  # type: ignore[assignment]
 
         return h
 
@@ -233,29 +195,24 @@ class EventRegistry:
 
 
 class Publisher(object):
-    def publish(self, evt: Any, **kwargs):
-        """Raises an event from this provider.
+    def __init__(self):
+        self._evt_provider_id = uuid4()
 
-        There are three way to raise events:
-        1. Raising an class decorated with @event:
-            This is the suggested way to raise events since it ensures consistent data arriving at the listeners
-            The given class will be passed to the listener callback
+    def publish(self, evt: Event, **kwargs):
+        """Publish an event from this provider.
 
-        2. By Event name and **kwargs:
-            This method will pass the kwargs as a dictionary to the listeners.
-            Note: The dictionary will be updated with the `event` key before being passed to the listeners
+        The `evt` argument can be:
+        - an Event subclass instance (preferred),
+        - a string event name together with kwargs to construct the event dict, or
+        - a dict containing an "event" key.
 
-        3. Raising a dictionary:
-            The dictionary must contain an `event` key with the name of the event. We suggest to use method 2 instead
-            of this one.
-
-        Args:
-            evt (EventClass | str | dict): The event to raise. It can be either a class decorated with `@event`, an event name or dictionary with an `event` key.
-            **kwargs: Arguments to pass as a dictionary to listeners. Only valid if evt is a string.
+        If `evt` is a string, any additional keyword arguments are merged into a
+        dict before dispatch. Additional kwargs are rejected for non-string
+        `evt` values.
         """
         EventRegistry.get_instance().publish(evt, self, **kwargs)
 
-    def listen(self, event: Any, callback: Callable[[Any], None]) -> ListenerHandle:
+    def listen(self, event: type[E], callback: Callable[[E], None]) -> ListenerHandle:
         """
         Listen for an event and register a callback function to be called when the event is published.
 
@@ -272,7 +229,7 @@ class Publisher(object):
         return EventRegistry.get_instance().add_listener(event, callback, self, False)
 
     def listen_once(
-        self, event: Type[Any] | UUID, callback: Callable
+        self, event: type[E], callback: Callable[[E], None]
     ) -> ListenerHandle:
         """
         Listen for an event once and register a callback function to be called when the event is published.
@@ -288,8 +245,8 @@ class Publisher(object):
         return EventRegistry.get_instance().add_listener(event, callback, self, True)
 
     def as_listener(
-        self, event: Any, ontime: bool = False
-    ) -> Callable[[Callable], ListenerCallback]:
+        self, event: type[E], ontime: bool = False
+    ) -> Callable[[Callable[[E], None]], ListenerCallback[E]]:
         """
         Returns a decorator that turns a callback function into a listener for a given event on the publisher.
         The decorated function will have a `stop_listening` method that can be used to stop listening to the event.
@@ -299,12 +256,12 @@ class Publisher(object):
             ontime (bool, optional): Whether the eavesdropper should only be active for one event. Defaults to False.
         """
 
-        def wrapper(callback: Callable) -> ListenerCallback:
-            h = EventRegistry.get_instance().add_listener(event, callback, self, ontime)
-            setattr(callback, "stop_listening", h.stop_listening)
-            return callback
+        def decorator(fn: Callable[[E], None]) -> ListenerCallback[E]:
+            h = EventRegistry.get_instance().add_listener(event, fn, self, ontime)
+            setattr(fn, "stop_listening", h.stop_listening)
+            return cast(ListenerCallback[E], fn)
 
-        return wrapper
+        return decorator
 
     def connect_tk_event(self, widget: tk.Widget, event: str):
         """
@@ -317,121 +274,81 @@ class Publisher(object):
         Returns:
             None
         """
+        raise NotImplementedError("Currently not implemented")
+        # def closure(evt):
+        #     self.publish(event, widget=widget)
 
-        def closure(evt):
-            self.publish(event, widget=widget)
-
-        widget.bind(event, closure)
+        # widget.bind(event, closure)
 
 
 # Global events
-def publish(evt: Any, **kwargs):
-    """
-    Publish a global event with the given `evt` and optional keyword arguments.
+def publish(evt: Event, **kwargs):
+    """Publish a global event (no specific provider).
 
-    Args:
-        evt (Any): The event to be published.
-        **kwargs: Optional keyword arguments to be passed to the event.
-
-    Raises:
-        RuntimeError: If `kwargs` are provided and `evt` is not a string.
-
-    Returns:
-        None
+    See :meth:`EventRegistry.publish` for accepted `evt` forms and behaviour.
     """
     EventRegistry.get_instance().publish(evt, provider=None, **kwargs)
 
 
-def listen(evt: Any, callback: Callable) -> ListenerHandle:
-    """
-    Returns a ListenerHandle after adding a listener for the specified global event using the provided callback.
-    See EventProvider.listen for details how events can be specified.
+def listen(evt: type[E], callback: Callable[[E], None]) -> ListenerHandle:
+    """Register a global listener for event `evt`.
 
-    Parameters:
-        event (Type[EventClass] | str): The event to listen for. It can be either a class decorated with `@event` or an event name.
-        callback (Callable): The function to be called when the event is published. The argument is either an instance of type `event` or a dictionary
-
-    Returns:
-        ListenerHandle: A handle to the listener.
+    The callback will be called with a single argument: the event object or
+    the event dict, depending on how the event was published.
     """
     return EventRegistry.get_instance().add_listener(
         evt, callback, provider=None, onetime=False
     )
 
 
-def listen_once(evt: Any, callback: Callable) -> ListenerHandle:
-    """
-    Add a one-time listener for the specified global event using the provided callback.
-    See EventProvider.listen for details how events can be specified.
-
-    Args:
-        event (Type[EventClass] | str): The event to listen for. It can be either a class decorated with `@event` or an event name.
-        callback (Callable): The function to be called when the event is published. The argument is either an instance of type `event` or a dictionary
-
-    Returns:
-        ListenerHandle: A handle to the listener that can be used to stop listening to the event.
-    """
+def listen_once(evt: type[E], callback: Callable[[E], None]) -> ListenerHandle:
+    """Register a one-time global listener. The listener is removed after
+    it is called once."""
     return EventRegistry.get_instance().add_listener(
         evt, callback, provider=None, onetime=True
     )
 
 
-def eavesdrop(evt: Any, callback: Callable) -> ListenerHandle:
-    """
-    Adds a listener that will be called whenever the event `evt` is published, globally or by any provider.
-    See EventProvider.listen for details how events can be specified.
-
-    Args:
-        evt (Any): The event to add the eavesdropper for. It can be either a class decorated with `@event` or an event name.
-        callback (Callable): The function to be called when the event is published. The first argument is either an instance of type `evt` or a dictionary.
-                             The second argument is the provider that published the event or None if it is a global event.
-    Returns:
-        ListenerHandle: A handle to the eavesdropper that can be used to stop listening to the event.
+def eavesdrop(
+    evt: type[E], callback: Callable[[E, Optional[Publisher]], None]
+) -> ListenerHandle:
+    """Register a global eavesdropper that receives every publication of
+    `evt` from any provider. The callback receives (event, provider).
     """
     return EventRegistry.get_instance().add_eavesdropper(evt, callback, onetime=False)
 
 
-def eavesdrop_once(evt: Any, callback: Callable) -> ListenerHandle:
-    """
-    Adds a one-time eavesdropper for the specified event.
-    See EventProvider.listen for details how events can be specified.
-
-    Args:
-        evt (Any): The event to add the eavesdropper for. It can be either a class decorated with `@event` or an event name.
-        callback (Callable): The function to be called when the event is published. The first argument is either an instance of type `evt` or a dictionary.
-                             The second argument is the provider that published the event or None if it is a global event.
-
-    Returns:
-        ListenerHandle: A handle to the eavesdropper that can be used to stop listening to the event.
-    """
+def eavesdrop_once(
+    evt: type[E], callback: Callable[[E, Optional[Publisher]], None]
+) -> ListenerHandle:
+    """Register a one-time global eavesdropper. The eavesdropper is removed
+    automatically after the first call."""
     return EventRegistry.get_instance().add_eavesdropper(evt, callback, onetime=True)
 
 
 def as_eavesdropper(
-    evt: Any, ontime: bool = False
-) -> Callable[[Callable], EavesdropperCallback]:
-    """
-    Decorator function that adds an eavesdropper for the specified event to the event registry.
-    The decorated function will have a `stop_listening` method that can be used to stop listening to the event.
+    evt: type[E], ontime: bool = False
+) -> Callable[[Callable[[E, Optional[Publisher]], None]], EavesdropperCallback[E]]:
+    """Return a decorator that registers the decorated function as an
+    eavesdropper for `evt`.
 
-    Args:
-        evt (Any): The event to add the eavesdropper for. It can be either a class decorated with `@event` or an event name.
-        ontime (bool, optional): Whether the eavesdropper should only be active for one event. Defaults to False.
-
+    The decorated function will be given a `stop_listening()` attribute which
+    can be called to unregister it.
     """
 
-    def wrapper(callback: Callable) -> EavesdropperCallback:
+    def wrapper(
+        callback: Callable[[E, Optional[Publisher]], None],
+    ) -> EavesdropperCallback[E]:
         h = EventRegistry.get_instance().add_eavesdropper(evt, callback, ontime)
         setattr(callback, "stop_listening", h.stop_listening)
-        return callback
+        return cast(EavesdropperCallback[E], callback)
 
     return wrapper
 
 
 if __name__ == "__main__":
 
-    @event
-    class MyEvent:
+    class MyEvent(Event):
         msg: str
 
     provider = Publisher()

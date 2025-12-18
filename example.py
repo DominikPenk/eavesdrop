@@ -1,8 +1,7 @@
 from eavesdrop import *
 
 
-@event
-class MyEvent:
+class MyEvent(Event):
     msg: str
 
 
